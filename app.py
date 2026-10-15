@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import unicodedata
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pandas as pd
@@ -10,7 +12,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.3"
 MIRO_SCORE_COLUMN = 8  # H: Moodle grade
 FIRST_WEEK_COLUMN = 10  # J: keep I (last downloaded) intact
 SETTINGS_SHEET = "Miro_Settings"
@@ -32,17 +34,41 @@ def normalize_number(value):
         return value
 
 
-def id_last4(value) -> str:
-    if value is None:
+def normalized_id_text(value) -> str:
+    """Render numbers and text IDs consistently, including Excel-style '1234.0'."""
+    if value is None or value == "":
         return ""
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-    s = str(value).strip()
-    digits = "".join(re.findall(r"\d", s))
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    raw = unicodedata.normalize("NFKC", str(value)).strip()
+    if not raw or raw.startswith("="):
+        # Do not accidentally identify the cell reference in an Excel formula.
+        return ""
+    # Sometimes a CSV import or Excel reformatting produces an integer ID with
+    # a trailing .0, or the string "1.2345678E+07".
+    try:
+        if re.fullmatch(r"[+\-]?[0-9]+(?:\.0+)?", raw) or re.fullmatch(
+            r"[+\-]?[0-9]+(?:\.[0-9]+)?[Ee][+\-]?[0-9]+", raw
+        ):
+            number = Decimal(raw)
+            if number == number.to_integral_value():
+                return format(number, "f").split(".", 1)[0]
+    except InvalidOperation:
+        pass
+    return raw
+
+
+def id_last4(value) -> str:
+    normalized = normalized_id_text(value)
+    digits = "".join(re.findall(r"[0-9]", normalized))
     if digits:
-        return digits[-4:].zfill(4) if len(digits) < 4 else digits[-4:]
-    compact = re.sub(r"\s+", "", s)
-    return compact[-4:]
+        return digits[-4:].zfill(4)
+    return ""
 
 
 def find_header_row(ws) -> int | None:
@@ -151,21 +177,70 @@ def ensure_week_columns(ws, header_row: int, num_weeks: int):
 
 
 def student_rows(ws, header_row: int):
+    """Read English names (A), Japanese names (B), and student IDs (C)."""
     rows = []
     for r in range(header_row + 1, ws.max_row + 1):
+        name_en = ws.cell(r, 1).value
         name = ws.cell(r, 2).value
         student_id = ws.cell(r, 3).value
-        if (name is None or str(name).strip() == "") and (student_id is None or str(student_id).strip() == ""):
+        if all(value is None or not str(value).strip() for value in (name_en, name, student_id)):
             continue
         rows.append(
             {
                 "row": r,
                 "id4": id_last4(student_id),
                 "name": str(name or "").strip(),
+                "name_en": str(name_en or "").strip(),
                 "id_full": student_id,
             }
         )
     return rows
+
+
+def normalize_search(value) -> str:
+    """Normalize case, full-width characters and whitespace for matching."""
+    raw = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[\s\u200b\u3000・･.,_\-]+", "", raw)
+
+
+def student_display(student) -> str:
+    japanese = student["name"]
+    english = student.get("name_en", "")
+    names = f"{japanese} / {english}" if japanese and english else japanese or english or "（氏名なし）"
+    return f"{student['id4'] or '----'} | {names}"
+
+
+def student_match_score(student, query: str) -> int:
+    """Find candidates even from a longer copied Miro sticky-note body."""
+    query = str(query or "").strip()
+    q = normalize_search(query)
+    if not q:
+        return 0
+
+    digits_in_query = "".join(re.findall(r"[0-9]", unicodedata.normalize("NFKC", query)))
+    last4 = student["id4"]
+    full_id = normalize_search(normalized_id_text(student.get("id_full")))
+    if last4 and len(last4) == 4 and last4 in digits_in_query:
+        return 120
+    if full_id and len(full_id) >= 4 and q in full_id:
+        return 110
+
+    for name in (student["name"], student.get("name_en", "")):
+        normalized = normalize_search(name)
+        if not normalized:
+            continue
+        if q == normalized:
+            return 100
+        if q in normalized:
+            return 90
+        if len(normalized) >= 3 and normalized in q:
+            return 80
+        # English given-name/family-name order may be reversed in Miro.
+        parts = [normalize_search(x) for x in re.split(r"[\s,]+", name.strip())]
+        parts = [x for x in parts if len(x) >= 2]
+        if len(parts) >= 2 and all(x in q for x in parts):
+            return 70
+    return 0
 
 
 def compute_raw_total(ws, row: int, week_cols: dict[int, int], active_weeks: list[int]) -> float:
@@ -233,6 +308,7 @@ def build_table(ws, header_row: int, settings, week_cols, current_week: int):
 
 st.set_page_config(page_title="Miro Grader", page_icon="🧩", layout="wide")
 st.title("🧩 Miro Group Work Grader")
+st.caption(f"アプリバージョン: v{APP_VERSION}")
 st.caption("ExcelのJ列以降にWeek別点数を保存し、H列へMiroの最終評定を自動反映します。I列は保持します。")
 
 uploaded = st.file_uploader("評定Excel（.xlsx）を選択", type=["xlsx"])
@@ -252,6 +328,7 @@ if st.session_state.get("loaded_hash") != file_hash:
     if not candidates:
         st.error("B列「氏名」、C列「IDナンバ」、H列「グループワーク (Miro)」の見出しを持つシートが見つかりませんでした。")
         st.stop()
+    st.session_state.pop("selected_student_rows", None)
     st.session_state.loaded_hash = file_hash
     st.session_state.wb = wb
     st.session_state.target_sheet = candidates[0][0]
@@ -274,6 +351,7 @@ if selected_sheet != st.session_state.target_sheet:
         st.stop()
     st.session_state.target_sheet = selected_sheet
     st.session_state.header_row = detected
+    st.session_state.pop("selected_student_rows", None)
 
 ws = wb[st.session_state.target_sheet]
 header_row = st.session_state.header_row
@@ -312,6 +390,36 @@ if save_settings:
 week_cols = ensure_week_columns(ws, header_row, settings["num_weeks"])
 roster = student_rows(ws, header_row)
 
+# Show what was actually read from the workbook. This makes it possible to
+# distinguish a search problem from a missing/misformatted ID column.
+with st.expander("🔎 名簿の読み取り確認（下4桁で候補が出ない場合）", expanded=False):
+    parsed = sum(bool(s["id4"]) for s in roster)
+    st.write(
+        f"対象シート: **{ws.title}** ／見出し行: **{header_row}行目** ／ "
+        f"学生: **{len(roster)}人** ／C列から下4桁を抽出できた学生: **{parsed}人**"
+    )
+    if parsed == 0:
+        st.error("C列から学籍番号の数字を読み取れていません。見出しと実際のID列を確認してください。")
+    elif parsed < len(roster):
+        st.warning("一部の学生でC列のIDが空欄、数式、または数字なしになっています。")
+    if roster:
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Excel行": s["row"],
+                    "A列（英語名）": s["name_en"],
+                    "B列（氏名）": s["name"],
+                    "C列（Excel上の値）": str(s["id_full"] or ""),
+                    "検索に使う下4桁": s["id4"] or "（抽出できず）",
+                }
+                for s in roster
+            ),
+            hide_index=True,
+            use_container_width=True,
+            height=245,
+        )
+        st.caption("ここに表示された下4桁が検索可能な番号です。表示が違う場合はExcelのC列を確認してください。")
+
 if st.session_state.get("flash"):
     st.success(st.session_state.pop("flash"))
 
@@ -332,19 +440,56 @@ entered_count = sum(1 for stu in roster if ws.cell(stu["row"], current_col).valu
 st.progress(entered_count / len(roster) if roster else 0, text=f"Week {current_week}: {entered_count} / {len(roster)} 人入力済み")
 
 st.subheader(f"Week {current_week} の採点")
-search = st.text_input("学生を絞り込み（氏名または下4桁）", placeholder="例: 1234 / 山田")
-filtered = roster
-if search.strip():
-    q = search.strip().lower()
-    filtered = [s for s in roster if q in s["id4"].lower() or q in s["name"].lower()]
-
-option_map = {f"{s['id4']} | {s['name']}": s for s in filtered}
-selected_labels = st.multiselect(
-    "このグループの学生を選択",
-    list(option_map.keys()),
-    placeholder="名前または下4桁を入力すると検索できます",
+st.caption("A列の英語名・B列の氏名・C列の学籍番号（下4桁）から候補を検索します。")
+search = st.text_area(
+    "学生の候補を探す（Miroの付箋本文も貼り付け可能）",
+    placeholder="例: 1234 / 山田 / Taro Yamada / Miroの投稿内容",
+    height=80,
 )
-selected_students = [option_map[x] for x in selected_labels]
+
+# Keep the group selection independent of the search query. Filtering a
+# multiselect's options on every keystroke would discard earlier selections.
+roster_by_row = {s["row"]: s for s in roster}
+if "selected_student_rows" not in st.session_state:
+    st.session_state["selected_student_rows"] = []
+
+
+def add_candidate(row_number: int):
+    selected = list(st.session_state.get("selected_student_rows", []))
+    if row_number not in selected:
+        selected.append(row_number)
+        st.session_state["selected_student_rows"] = selected
+
+
+if search.strip():
+    candidates = sorted(
+        ((student_match_score(s, search), s) for s in roster),
+        key=lambda item: (-item[0], item[1]["row"]),
+    )
+    candidates = [s for score, s in candidates if score > 0]
+    st.caption(f"該当候補: {len(candidates)} 人（候補をクリックするとグループに追加）")
+    for i in range(0, min(len(candidates), 12), 2):
+        cols = st.columns(2)
+        for col, stu in zip(cols, candidates[i : i + 2]):
+            with col:
+                st.button(
+                    f"＋ {student_display(stu)}",
+                    key=f"candidate_add_{stu['row']}",
+                    on_click=add_candidate,
+                    args=(stu["row"],),
+                    use_container_width=True,
+                )
+    if not candidates:
+        st.warning("該当者がいません。上の『名簿の読み取り確認』を開き、ExcelのC列と抽出された下4桁を確認してください。下の選択欄からも探せます。")
+
+selected_rows = st.multiselect(
+    "このグループの学生を選択（直接検索も可能）",
+    options=list(roster_by_row.keys()),
+    format_func=lambda row_number: student_display(roster_by_row[row_number]),
+    key="selected_student_rows",
+    placeholder="氏名・英語名・下4桁を入力して検索・追加",
+)
+selected_students = [roster_by_row[r] for r in selected_rows]
 
 score_col, action_col = st.columns([1, 2])
 with score_col:
